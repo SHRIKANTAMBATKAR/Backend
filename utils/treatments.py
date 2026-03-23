@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 disease_treatments = {
 
 "Apple___Apple_scab":
@@ -223,6 +222,4 @@ disease_treatments = {
 
 "Tomato___healthy":
 "Plant is healthy. Maintain balanced watering and organic fertilization."
-
->>>>>>> f053e7e93568d56c92feb94f8a5dd77d6d65d6ab
 }
