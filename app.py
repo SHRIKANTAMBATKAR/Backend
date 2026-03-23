@@ -29,7 +29,13 @@ db_config = {
 
 # Aiven MySQL requires SSL to connect
 if os.getenv('DB_USE_SSL', 'false').lower() == 'true':
-    db_config['ssl'] = {}
+    # Check if a specific CA file is provided (best for Aiven)
+    ca_path = os.path.join(os.path.dirname(__file__), 'ca.pem')
+    if os.path.exists(ca_path):
+        db_config['ssl'] = {'ca': ca_path}
+    else:
+        # Fallback: Just enable SSL (REQUIRED mode) without strict CA verification
+        db_config['ssl'] = {}
 
 def get_db_connection():
     try:
