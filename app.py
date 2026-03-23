@@ -29,7 +29,7 @@ db_config = {
 
 # Aiven MySQL requires SSL to connect
 if os.getenv('DB_USE_SSL', 'false').lower() == 'true':
-    db_config['ssl'] = {'ca': '/etc/ssl/certs/ca-certificates.crt'}
+    db_config['ssl'] = {}
 
 def get_db_connection():
     try:
