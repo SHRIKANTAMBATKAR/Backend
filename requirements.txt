@@ -1,22 +1,9 @@
-<<<<<<< HEAD
-flask
-flask-cors
-pillow
-requests
-requests
-python-dotenv
-pymysql
-werkzeug
-gunicorn
-=======
 Flask==3.0.3
 flask-cors==5.0.0
 gunicorn==23.0.0
-numpy==1.26.4
 Pillow==10.4.0
 python-dotenv==1.0.1
 requests==2.32.3
-mysql-connector-python==9.0.0
-tensorflow==2.15.0
 pymysql
->>>>>>> f053e7e93568d56c92feb94f8a5dd77d6d65d6ab
+werkzeug
+mysql-connector-python==9.0.0
