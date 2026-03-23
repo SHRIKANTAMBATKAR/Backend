@@ -1,0 +1,102 @@
+<<<<<<< HEAD
+<!DOCTYPE html>
+<html>
+<head>
+<title>Smart Krishi</title>
+</head>
+
+<body>
+
+<h2>Smart Krishi Disease Detection</h2>
+
+<input type="file" id="image">
+
+<button onclick="upload()">Detect Disease</button>
+
+<p id="result"></p>
+
+<script>
+
+function upload(){
+
+let file=document.getElementById("image").files[0]
+
+let formData=new FormData()
+
+formData.append("image",file)
+
+fetch("/predict",{
+
+method:"POST",
+body:formData
+
+})
+
+.then(res=>res.json())
+.then(data=>{
+
+document.getElementById("result").innerHTML=
+
+"Disease: "+data.disease+
+"<br>Confidence: "+data.confidence+"%"+
+"<br>Treatment: "+data.treatment
+
+})
+
+}
+
+</script>
+
+</body>
+=======
+<!DOCTYPE html>
+<html>
+<head>
+<title>Smart Krishi</title>
+</head>
+
+<body>
+
+<h2>Smart Krishi Disease Detection</h2>
+
+<input type="file" id="image">
+
+<button onclick="upload()">Detect Disease</button>
+
+<p id="result"></p>
+
+<script>
+
+function upload(){
+
+let file=document.getElementById("image").files[0]
+
+let formData=new FormData()
+
+formData.append("image",file)
+
+fetch("/predict",{
+
+method:"POST",
+body:formData
+
+})
+
+.then(res=>res.json())
+.then(data=>{
+
+document.getElementById("result").innerHTML=
+
+"Disease: "+data.disease+
+"<br>Confidence: "+data.confidence+"%"+
+"<br>Treatment: "+data.treatment
+
+})
+
+}
+
+</script>
+
+</body>
+>>>>>>> f053e7e93568d56c92feb94f8a5dd77d6d65d6ab
+</html>
