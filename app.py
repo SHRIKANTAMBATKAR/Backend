@@ -8,7 +8,8 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from utils.treatments import disease_treatments
 
-import pymysql
+import psycopg2
+import psycopg2.extras
 from werkzeug.security import generate_password_hash, check_password_hash
 import smtplib
 import ssl
@@ -17,44 +18,40 @@ from email.message import EmailMessage
 # Load environment variables
 load_dotenv()
 
-# Database Configuration
+# Database Configuration (Aiven PostgreSQL)
 db_config = {
     'host': os.getenv('DB_HOST'),
     'user': os.getenv('DB_USER'),
     'password': os.getenv('DB_PASSWORD'),
     'database': os.getenv('DB_NAME'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'cursorclass': pymysql.cursors.DictCursor
+    'port': int(os.getenv('DB_PORT')),
 }
-
-# Aiven MySQL requires SSL to connect
-if os.getenv('DB_USE_SSL', 'false').lower() == 'true':
-    # Check if a specific CA file is provided (best for Aiven)
-    ca_path = os.path.join(os.path.dirname(__file__), 'ca.pem')
-    if os.path.exists(ca_path):
-        db_config['ssl'] = {'ca': ca_path}
-    else:
-        # Fallback: Just enable SSL (REQUIRED mode) without strict CA verification
-        db_config['ssl'] = {}
 
 def get_db_connection():
     try:
-        return pymysql.connect(**db_config)
-    except pymysql.MySQLError as e:
-        print(f"Error connecting to MySQL Database: {e}")
+        # PostgreSQL SSL settings
+        ssl_args = {"sslmode": "require"}
+        ca_path = os.path.join(os.path.dirname(__file__), 'ca.pem')
+        if os.path.exists(ca_path):
+            ssl_args["sslrootcert"] = ca_path
+            
+        return psycopg2.connect(**db_config, **ssl_args)
+    except psycopg2.Error as e:
+        print(f"❌ Error connecting to PostgreSQL Database: {e}")
         return None
 
 def init_db():
+    print("DEBUG: Initializing database tables (PostgreSQL)...")
     conn = get_db_connection()
     if conn is None:
         return
     
     try:
         with conn.cursor() as cursor:
-            # Create users table if it doesn't exist
+            # Create users table (SERIAL for autoincrement in Postgres)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
                     email VARCHAR(255) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
@@ -62,10 +59,10 @@ def init_db():
                 )
             """)
 
-            # Create care_requests table for contact expert form
+            # Create care_requests table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS care_requests (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     farmer_name VARCHAR(255) NOT NULL,
                     mobile_number VARCHAR(20) NOT NULL,
                     crop_name VARCHAR(100) NOT NULL,
@@ -74,9 +71,9 @@ def init_db():
                 )
             """)
         conn.commit()
-        print("Database initialized completely.")
-    except pymysql.MySQLError as e:
-         print(f"Error formatting database: {e}")
+        print("✅ Database initialized completely.")
+    except psycopg2.Error as e:
+         print(f"❌ Error formatting database: {e}")
     finally:
         conn.close()
 
@@ -147,7 +144,7 @@ def register_user():
         return jsonify({"error": "Database connection failed"}), 500
     
     try:
-        with conn.cursor() as cursor:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             # Check if user already exists
             cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
             if cursor.fetchone():
@@ -160,7 +157,7 @@ def register_user():
             )
         conn.commit()
         return jsonify({"message": "User registered successfully"}), 201
-    except pymysql.MySQLError as e:
+    except psycopg2.Error as e:
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
@@ -179,7 +176,7 @@ def login_user():
         return jsonify({"error": "Database connection failed"}), 500
 
     try:
-        with conn.cursor() as cursor:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             # Fetch user
             cursor.execute("SELECT id, name, email, password_hash FROM users WHERE email = %s", (email,))
             user = cursor.fetchone()
@@ -216,7 +213,7 @@ def contact_expert():
         return jsonify({"error": "Database connection failed"}), 500
 
     try:
-        with conn.cursor() as cursor:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute(
                 "INSERT INTO care_requests (farmer_name, mobile_number, crop_name, issue) VALUES (%s, %s, %s, %s)",
                 (farmer_name, mobile_number, crop_name, issue)
@@ -248,7 +245,7 @@ def contact_expert():
                 print(f"DEBUG: Error sending email: {email_err}")
 
         return jsonify({"message": "Your request has been submitted successfully!"}), 201
-    except pymysql.MySQLError as e:
+    except psycopg2.Error as e:
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
