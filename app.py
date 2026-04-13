@@ -18,13 +18,13 @@ from email.message import EmailMessage
 # Load environment variables
 load_dotenv()
 
-# Database Configuration (Aiven PostgreSQL)
+# Database Configuration (PostgreSQL)
 db_config = {
     'host': os.getenv('DB_HOST'),
     'user': os.getenv('DB_USER'),
     'password': os.getenv('DB_PASSWORD'),
     'database': os.getenv('DB_NAME'),
-    'port': int(os.getenv('DB_PORT')),
+    'port': int(os.getenv('DB_PORT', 5432)), # Default Postgres port falls back to 5432 if not set
 }
 
 def get_db_connection():
@@ -192,7 +192,7 @@ def login_user():
                 }), 200
             else:
                  return jsonify({"error": "Invalid email or password"}), 401
-    except pymysql.MySQLError as e:
+    except psycopg2.Error as e:
          return jsonify({"error": str(e)}), 500
     finally:
          conn.close()
@@ -360,7 +360,7 @@ def predict():
             GEMINI_CHAT_URL,
             headers={"Content-Type": "application/json"},
             json=body,
-            timeout=40
+            timeout=55  # 55s — fits within gunicorn's 120s worker timeout
         )
         
         if resp.status_code != 200:
