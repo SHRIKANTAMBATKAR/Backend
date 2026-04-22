@@ -113,3 +113,127 @@ Smart-Krishi
 │   └── templates
 │
 └── README.md
+
+# 🧠 Machine Learning Model
+
+The crop disease detection model is trained using the **PlantVillage dataset**.
+
+---
+
+## 📂 Dataset Information
+
+- **Dataset:** PlantVillage  
+- **Number of Classes:** 38  
+- Multiple crop disease categories  
+- Healthy and diseased leaf images  
+
+---
+
+## 🏗️ Model Architecture
+
+- Convolutional Neural Network (CNN)  
+- Image preprocessing  
+- Data augmentation  
+- Multi-class classification  
+
+---
+
+# ⚙️ Installation Guide
+
+## 1️⃣ Clone Repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/Smart-Krishi.git
+2️⃣ Frontend Setup
+cd frontend
+
+npm install
+
+npm run dev
+
+Frontend runs on:
+
+http://localhost:5173
+3️⃣ Backend Setup
+cd backend
+
+pip install -r requirements.txt
+4️⃣ Create Environment Variables
+
+Create a .env file inside the backend folder:
+
+GEMINI_API_KEY=your_gemini_api_key
+
+MAIL_USERNAME=your_email@gmail.com
+
+MAIL_PASSWORD=your_app_password
+
+MYSQL_HOST=localhost
+
+MYSQL_USER=root
+
+MYSQL_PASSWORD=your_password
+
+MYSQL_DB=smart_krishi
+5️⃣ Run Backend
+python app.py
+
+Backend runs on:
+
+http://localhost:5000
+## 📸 Disease Detection Workflow
+User Uploads Leaf Image
+        ↓
+Frontend Sends Image to Backend
+        ↓
+Flask Backend Processes Image
+        ↓
+CNN Model Predicts Disease
+        ↓
+Treatment Suggestions Generated
+        ↓
+Results Displayed to User
+
+### 📊 Supported Crop Diseases
+
+The system supports disease detection for:
+
+- Apple
+- Tomato
+- Potato
+Corn
+Grape
+Pepper
+Peach
+Strawberry
+Soybean
+Orange
+
+### 🔐 Authentication Features
+User Login
+User Registration
+Protected Routes
+Session Handling
+
+### 🌍 Future Scope
+Mobile application support
+Multi-language support
+Voice-based farming assistant
+Weather integration
+Real-time crop monitoring
+AI-based fertilizer recommendation
+
+### 📌 Advantages
+Early disease detection
+Reduces crop loss
+Farmer-friendly interface
+Promotes sustainable farming
+Instant farming guidance
+
+### ⚠️ Limitations
+Requires internet connection
+Depends on image quality
+Limited to trained disease classes
+
+##👨‍💻 Developed By
+Shrikant Ambatkar
