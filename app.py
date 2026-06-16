@@ -74,7 +74,6 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
             # Create password reset tokens table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS password_reset_tokens (
