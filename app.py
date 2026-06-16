@@ -15,6 +15,10 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 
+from apscheduler.schedulers.background import BackgroundScheduler
+import datetime as _dt_global
+import atexit
+
 # Load environment variables
 load_dotenv()
 
@@ -81,6 +85,20 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Create weather subscriptions table for auto-alert system
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS weather_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) NOT NULL,
+                    lat DOUBLE PRECISION NOT NULL,
+                    lon DOUBLE PRECISION NOT NULL,
+                    location_name VARCHAR(255) NOT NULL DEFAULT 'Your Location',
+                    last_alerted_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(email)
+                )
+            """)
         conn.commit()
         print("✅ Database initialized completely.")
     except psycopg2.Error as e:
@@ -102,6 +120,149 @@ CORS(app)
 
 # Initialize database on startup
 init_db()
+
+# ──────────────────────────────────────────────────────────────
+# BACKGROUND AUTO-ALERT SCHEDULER
+# ──────────────────────────────────────────────────────────────
+ALERT_COOLDOWN_HOURS = 3  # Don't re-alert the same user within 3 hours
+
+def _auto_weather_check_job():
+    """
+    Background job: runs every 30 minutes.
+    Fetches all weather subscriptions, checks conditions for each,
+    and sends alert emails when medium/high severity conditions are detected.
+    Enforces a cooldown to avoid spamming.
+    """
+    print(f"[AutoAlert] Running weather check job at {_dt_global.datetime.utcnow().isoformat()}Z")
+    conn = get_db_connection()
+    if conn is None:
+        print("[AutoAlert] DB connection failed — skipping job.")
+        return
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute("SELECT id, email, lat, lon, location_name, last_alerted_at FROM weather_subscriptions")
+            subscriptions = cursor.fetchall()
+
+        print(f"[AutoAlert] Found {len(subscriptions)} subscription(s) to check.")
+
+        for sub in subscriptions:
+            email         = sub['email']
+            lat           = sub['lat']
+            lon           = sub['lon']
+            location_name = sub['location_name']
+            last_alerted  = sub['last_alerted_at']
+
+            # Enforce cooldown
+            if last_alerted is not None:
+                since_hours = (_dt_global.datetime.utcnow() - last_alerted).total_seconds() / 3600
+                if since_hours < ALERT_COOLDOWN_HOURS:
+                    print(f"[AutoAlert] Skipping {email} — cooldown ({since_hours:.1f}h < {ALERT_COOLDOWN_HOURS}h)")
+                    continue
+
+            # Fetch weather
+            try:
+                params = {
+                    "latitude":  lat,
+                    "longitude": lon,
+                    "current": [
+                        "temperature_2m", "relativehumidity_2m",
+                        "precipitation", "windspeed_10m",
+                        "weathercode", "apparent_temperature"
+                    ],
+                    "hourly": [
+                        "temperature_2m", "precipitation",
+                        "windspeed_10m", "relativehumidity_2m"
+                    ],
+                    "forecast_days": 2,
+                    "timezone": "auto"
+                }
+                resp = requests.get(OPEN_METEO_BASE, params=params, timeout=10)
+                resp.raise_for_status()
+                wd = resp.json()
+            except Exception as we:
+                print(f"[AutoAlert] Weather fetch error for {email}: {we}")
+                continue
+
+            # Build hourly list
+            hourly_raw = wd.get("hourly", {})
+            now_utc    = _dt_global.datetime.utcnow()
+            hours_list = []
+            for i, t in enumerate(hourly_raw.get("time", [])[:48]):
+                try:
+                    slot_time = _dt_global.datetime.fromisoformat(t)
+                except Exception:
+                    continue
+                diff_hours = (slot_time - now_utc).total_seconds() / 3600
+                if 0 <= diff_hours <= 6:
+                    hours_list.append({
+                        "temperature_2m":      hourly_raw.get("temperature_2m",     [0]*48)[i] or 0,
+                        "precipitation":       hourly_raw.get("precipitation",       [0]*48)[i] or 0,
+                        "windspeed_10m":       hourly_raw.get("windspeed_10m",       [0]*48)[i] or 0,
+                        "relativehumidity_2m": hourly_raw.get("relativehumidity_2m", [0]*48)[i] or 0,
+                    })
+
+            current_raw = wd.get("current", {})
+            current = {
+                "temperature_2m":       current_raw.get("temperature_2m", 25),
+                "apparent_temperature": current_raw.get("apparent_temperature", 25),
+                "relativehumidity_2m":  current_raw.get("relativehumidity_2m", 50),
+                "precipitation":        current_raw.get("precipitation", 0),
+                "windspeed_10m":        current_raw.get("windspeed_10m", 0),
+                "weathercode":          current_raw.get("weathercode", 0),
+            }
+
+            all_alerts = _condition_engine(current, hours_list)
+            bad_alerts = [a for a in all_alerts if a.get("severity") in ("high", "medium")]
+
+            if not bad_alerts:
+                print(f"[AutoAlert] {email} @ {location_name}: All clear — no email needed.")
+                continue
+
+            # Send alert email
+            sent = _send_weather_alert_email(email, location_name, bad_alerts)
+            if sent:
+                # Update last_alerted_at
+                try:
+                    conn2 = get_db_connection()
+                    if conn2:
+                        with conn2.cursor() as cur2:
+                            cur2.execute(
+                                "UPDATE weather_subscriptions SET last_alerted_at = %s WHERE email = %s",
+                                (_dt_global.datetime.utcnow(), email)
+                            )
+                        conn2.commit()
+                        conn2.close()
+                except Exception as dbe:
+                    print(f"[AutoAlert] DB update error for {email}: {dbe}")
+                print(f"[AutoAlert] ✅ Email sent to {email} with {len(bad_alerts)} alert(s).")
+            else:
+                print(f"[AutoAlert] ❌ Failed to send email to {email}.")
+
+    except Exception as e:
+        print(f"[AutoAlert] Unexpected error in job: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# Start scheduler — only once (gunicorn spawns multiple workers; use env flag to avoid duplicates)
+if os.environ.get("SCHEDULER_STARTED") != "1":
+    _scheduler = BackgroundScheduler(timezone="UTC")
+    _scheduler.add_job(
+        _auto_weather_check_job,
+        trigger="interval",
+        minutes=30,
+        id="auto_weather_alert",
+        replace_existing=True,
+        next_run_time=_dt_global.datetime.utcnow() + _dt_global.timedelta(seconds=10)  # first run 10s after start
+    )
+    _scheduler.start()
+    atexit.register(lambda: _scheduler.shutdown(wait=False))
+    os.environ["SCHEDULER_STARTED"] = "1"
+    print("[AutoAlert] ✅ Background scheduler started — checks every 30 minutes.")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
@@ -1027,6 +1188,373 @@ def farming_recommendation():
     except Exception as e:
         print(f"DEBUG farming-rec: unexpected error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+
+# ──────────────────────────────────────────────────────────────
+# WEATHER ALERT EMAIL
+# ──────────────────────────────────────────────────────────────
+
+def _send_weather_alert_email(to_email: str, location_name: str, alerts: list):
+    """
+    Send a beautifully styled HTML weather-alert email to `to_email`.
+    Only call this when alerts contain at least one medium/high severity item.
+    Returns True on success, False on failure.
+    """
+    if not EMAIL_SENDER or not EMAIL_PASSWORD:
+        print("DEBUG: EMAIL_SENDER or EMAIL_PASSWORD not configured — skipping email.")
+        return False
+
+    severity_labels = {
+        "high":   ("🔴 HIGH ALERT",   "#dc2626", "#fef2f2", "#fee2e2"),
+        "medium": ("🟡 MEDIUM ALERT", "#d97706", "#fffbeb", "#fef3c7"),
+        "low":    ("🟢 ALL CLEAR",    "#16a34a", "#f0fdf4", "#dcfce7"),
+    }
+
+    # Build one HTML block per alert
+    alert_html_parts = []
+    for a in alerts:
+        sev = a.get("severity", "low")
+        label, color, bg, border_color = severity_labels.get(sev, severity_labels["low"])
+        icon  = a.get("icon", "")
+        title = a.get("title", "Weather Alert")
+        msg   = a.get("message", "")
+        eta   = a.get("eta_minutes")
+        actions = a.get("actions", [])
+
+        eta_html = ""
+        if eta == 0:
+            eta_html = f'<p style="margin:8px 0 0;font-size:12px;color:#6b7280;">⏱ Status: <b>In Progress Now</b></p>'
+        elif eta is not None:
+            eta_html = f'<p style="margin:8px 0 0;font-size:12px;color:#6b7280;">⏱ Expected in approximately <b>{eta} minutes</b></p>'
+
+        actions_html = "".join(
+            f'<li style="margin:6px 0;font-size:14px;color:#374151;"><span style="display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;border-radius:50%;background:#fff;border:1px solid #d1d5db;font-size:11px;font-weight:700;color:#6b7280;margin-right:8px;">{i+1}</span>{act}</li>'
+            for i, act in enumerate(actions)
+        )
+
+        alert_html_parts.append(f"""
+        <div style="border:1.5px solid {border_color};border-radius:12px;background:{bg};margin-bottom:18px;overflow:hidden;">
+          <div style="padding:18px 20px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+              <span style="font-size:22px;">{icon}</span>
+              <span style="font-size:17px;font-weight:700;color:#111827;">{title}</span>
+              <span style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;background:{color};color:#fff;">{label}</span>
+            </div>
+            <p style="margin:0;font-size:14px;color:#4b5563;line-height:1.6;">{msg}</p>
+            {eta_html}
+          </div>
+          {"<div style='border-top:1px solid " + border_color + ";padding:14px 20px;'><p style='margin:0 0 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;'>🛡️ Preventive Actions</p><ul style='margin:0;padding:0;list-style:none;'>" + actions_html + "</ul></div>" if actions else ""}
+        </div>
+        """)
+
+    import datetime as _dt2
+    now_str = _dt2.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    all_alerts_html = "".join(alert_html_parts)
+
+    html_body = f"""\
+<html>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:30px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Header -->
+        <tr><td style="background:linear-gradient(135deg,#16a34a,#059669);border-radius:14px 14px 0 0;padding:28px 32px;text-align:center;">
+          <h1 style="margin:0;color:#fff;font-size:24px;font-weight:800;">🌿 Smart Krishi</h1>
+          <p style="margin:6px 0 0;color:#bbf7d0;font-size:14px;">Weather Alert Notification</p>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="background:#fff;border:1px solid #e5e7eb;border-top:none;padding:28px 32px;">
+
+          <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:14px 18px;margin-bottom:24px;">
+            <p style="margin:0;font-size:13px;color:#1d4ed8;">
+              📍 <b>Location:</b> {location_name} &nbsp;|&nbsp; 🕐 <b>Generated at:</b> {now_str}
+            </p>
+          </div>
+
+          <h2 style="font-size:18px;color:#111827;margin:0 0 6px;">🚨 Weather Alerts Detected</h2>
+          <p style="font-size:14px;color:#6b7280;margin:0 0 20px;">
+            The following weather conditions require your attention. Please take the listed preventive actions to protect your crops and livestock.
+          </p>
+
+          {all_alerts_html}
+
+          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:14px 18px;margin-top:8px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              Weather data powered by <a href="https://open-meteo.com" style="color:#0ea5e9;">Open-Meteo</a>.
+              Always cross-check with your local meteorology department for official forecasts.
+            </p>
+          </div>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="background:linear-gradient(135deg,#16a34a,#059669);border-radius:0 0 14px 14px;padding:18px 32px;text-align:center;">
+          <p style="margin:0;color:#bbf7d0;font-size:12px;">Stay safe &amp; farm smart · © 2025 Smart Krishi</p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    plain_body = f"Smart Krishi — Weather Alert for {location_name}\n\n"
+    for a in alerts:
+        plain_body += f"[{a.get('severity','').upper()}] {a.get('icon','')} {a.get('title','')}\n"
+        plain_body += f"{a.get('message','')}\n"
+        for i, act in enumerate(a.get("actions", []), 1):
+            plain_body += f"  {i}. {act}\n"
+        plain_body += "\n"
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"🌿 Smart Krishi Weather Alert — {location_name}"
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = to_email
+        msg.set_content(plain_body)
+        msg.add_alternative(html_body, subtype="html")
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            srv_pw = EMAIL_PASSWORD.strip('"').strip("'")
+            server.login(EMAIL_SENDER, srv_pw)
+            server.send_message(msg)
+        print(f"DEBUG: Weather alert email sent to {to_email}")
+        return True
+    except Exception as e:
+        print(f"DEBUG: Weather alert email error: {e}")
+        return False
+
+
+@app.route("/api/weather/send-alert", methods=["POST"])
+def send_weather_alert_email():
+    """
+    POST { email, lat, lon, locationName }
+    Fetches current weather, runs condition engine, emails bad-weather alerts
+    (medium or high severity) to the provided email address.
+    """
+    data          = request.get_json(force=True)
+    to_email      = (data.get("email") or "").strip()
+    lat           = data.get("lat")
+    lon           = data.get("lon")
+    location_name = (data.get("locationName") or "Your Location").strip()
+
+    # Validate inputs
+    if not to_email:
+        return jsonify({"error": "Email address is required"}), 400
+    if lat is None or lon is None:
+        return jsonify({"error": "lat and lon are required"}), 400
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return jsonify({"error": "lat and lon must be numeric"}), 400
+
+    # ── Fetch weather from Open-Meteo ────────────────────────
+    try:
+        params = {
+            "latitude":  lat,
+            "longitude": lon,
+            "current": [
+                "temperature_2m", "relativehumidity_2m",
+                "precipitation", "windspeed_10m",
+                "weathercode", "apparent_temperature"
+            ],
+            "hourly": [
+                "temperature_2m", "precipitation",
+                "windspeed_10m", "relativehumidity_2m"
+            ],
+            "forecast_days": 2,
+            "timezone": "auto"
+        }
+        resp = requests.get(OPEN_METEO_BASE, params=params, timeout=10)
+        resp.raise_for_status()
+        wd = resp.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Weather fetch error in send-alert: {e}")
+        return jsonify({"error": "Failed to fetch weather data"}), 502
+
+    # ── Build hourly next-6-hours list ───────────────────────
+    import datetime as _dta
+    hourly_raw = wd.get("hourly", {})
+    now_utc    = _dta.datetime.utcnow()
+    hours_list = []
+    for i, t in enumerate(hourly_raw.get("time", [])[:48]):
+        try:
+            slot_time = _dta.datetime.fromisoformat(t)
+        except Exception:
+            continue
+        diff_hours = (slot_time - now_utc).total_seconds() / 3600
+        if 0 <= diff_hours <= 6:
+            hours_list.append({
+                "temperature_2m":      hourly_raw.get("temperature_2m",      [0]*48)[i] or 0,
+                "precipitation":       hourly_raw.get("precipitation",        [0]*48)[i] or 0,
+                "windspeed_10m":       hourly_raw.get("windspeed_10m",        [0]*48)[i] or 0,
+                "relativehumidity_2m": hourly_raw.get("relativehumidity_2m",  [0]*48)[i] or 0,
+            })
+
+    current_raw = wd.get("current", {})
+    current = {
+        "temperature_2m":      current_raw.get("temperature_2m", 25),
+        "apparent_temperature": current_raw.get("apparent_temperature", 25),
+        "relativehumidity_2m":  current_raw.get("relativehumidity_2m", 50),
+        "precipitation":        current_raw.get("precipitation", 0),
+        "windspeed_10m":        current_raw.get("windspeed_10m", 0),
+        "weathercode":          current_raw.get("weathercode", 0),
+    }
+
+    # ── Run condition engine ─────────────────────────────────
+    all_alerts   = _condition_engine(current, hours_list)
+    bad_alerts   = [a for a in all_alerts if a.get("severity") in ("high", "medium")]
+
+    if not bad_alerts:
+        return jsonify({
+            "sent":         False,
+            "alerts_count": 0,
+            "message":      "No bad weather conditions detected right now — no alert email was sent. Conditions look safe!"
+        }), 200
+
+    # ── Send email ───────────────────────────────────────────
+    sent = _send_weather_alert_email(to_email, location_name, bad_alerts)
+    if sent:
+        return jsonify({
+            "sent":         True,
+            "alerts_count": len(bad_alerts),
+            "message":      f"Weather alert email sent to {to_email} with {len(bad_alerts)} alert(s)."
+        }), 200
+    else:
+        return jsonify({"error": "Failed to send email. Please check server email configuration."}), 500
+
+
+
+# ──────────────────────────────────────────────────────────────
+# WEATHER AUTO-ALERT SUBSCRIPTION ROUTES
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/weather/subscribe", methods=["POST"])
+def subscribe_weather_alerts():
+    """
+    POST { email, lat, lon, locationName }
+    Saves or updates the user's location for automatic weather alert emails.
+    """
+    data          = request.get_json(force=True)
+    email         = (data.get("email") or "").strip().lower()
+    lat           = data.get("lat")
+    lon           = data.get("lon")
+    location_name = (data.get("locationName") or "Your Location").strip()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+    if lat is None or lon is None:
+        return jsonify({"error": "lat and lon are required"}), 400
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return jsonify({"error": "lat and lon must be numeric"}), 400
+
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO weather_subscriptions (email, lat, lon, location_name)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (email) DO UPDATE
+                    SET lat = EXCLUDED.lat,
+                        lon = EXCLUDED.lon,
+                        location_name = EXCLUDED.location_name,
+                        last_alerted_at = NULL
+            """, (email, lat, lon, location_name))
+        conn.commit()
+        return jsonify({
+            "subscribed": True,
+            "message": f"Auto-alerts enabled for {email} at {location_name}. You'll be emailed when bad weather is detected (checked every 30 min)."
+        }), 200
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/weather/subscribe", methods=["DELETE"])
+def unsubscribe_weather_alerts():
+    """
+    DELETE { email }
+    Removes the user's weather alert subscription.
+    """
+    data  = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM weather_subscriptions WHERE email = %s", (email,))
+        conn.commit()
+        return jsonify({"subscribed": False, "message": "Auto-alerts disabled successfully."}), 200
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/weather/subscription", methods=["GET"])
+def get_subscription_status():
+    """
+    GET /api/weather/subscription?email=user@example.com
+    Returns the current subscription status and next alert eligibility.
+    """
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "email query parameter is required"}), 400
+
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({"error": "Database connection failed"}), 500
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                "SELECT email, lat, lon, location_name, last_alerted_at, created_at FROM weather_subscriptions WHERE email = %s",
+                (email,)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return jsonify({"subscribed": False}), 200
+
+        last_alerted = row["last_alerted_at"]
+        cooldown_remaining_min = 0
+        if last_alerted is not None:
+            since_hours = (_dt_global.datetime.utcnow() - last_alerted).total_seconds() / 3600
+            remaining   = max(0, ALERT_COOLDOWN_HOURS - since_hours)
+            cooldown_remaining_min = int(remaining * 60)
+
+        return jsonify({
+            "subscribed":             True,
+            "email":                  row["email"],
+            "location_name":          row["location_name"],
+            "lat":                    row["lat"],
+            "lon":                    row["lon"],
+            "last_alerted_at":        row["last_alerted_at"].isoformat() + "Z" if last_alerted else None,
+            "cooldown_remaining_min": cooldown_remaining_min,
+            "check_interval_min":     30,
+        }), 200
+    except psycopg2.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 @app.route("/api/geocode", methods=["GET"])
